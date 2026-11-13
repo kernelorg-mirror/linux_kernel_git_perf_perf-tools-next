@@ -1626,7 +1626,6 @@ static void cs_etm__add_stack_event(struct cs_etm_queue *etmq,
 {
 	struct cs_etm_auxtrace *etm = etmq->etm;
 	u64 from, to;
-	int size;
 
 	if (!etm->synth_opts.branches && !etm->synth_opts.instructions)
 		return;
@@ -1638,11 +1637,10 @@ static void cs_etm__add_stack_event(struct cs_etm_queue *etmq,
 		from = cs_etm__last_executed_instr(tidq->prev_packet);
 		to = cs_etm__first_executed_instr(tidq->packet);
 
-		size = cs_etm__instr_size(etmq, tidq, tidq->prev_packet, from);
-
 		/* Enable callchain so thread stack entry can be allocated */
 		thread_stack__event(tidq->frontend_thread, tidq->prev_packet->cpu,
-				    tidq->prev_packet->flags, from, to, size,
+				    tidq->prev_packet->flags, from, to,
+				    tidq->prev_packet->last_instr_size,
 				    etmq->buffer->buffer_nr + 1,
 				    etmq->etm->use_callchain,
 				    tidq->br_stack_sz, 0);
