@@ -1218,13 +1218,16 @@ out:
 	return ret;
 }
 
-static u32 cs_etm__frontend_mem_access(struct cs_etm_queue *etmq,
+static int cs_etm__frontend_mem_access(struct cs_etm_queue *etmq,
 				       struct cs_etm_traceid_queue *tidq,
 				       struct cs_etm_packet *packet,
 				       u64 address, size_t size, u8 *buffer)
 {
-	return __cs_etm__mem_access(etmq, address, size, buffer, 0, packet->el,
-				    tidq->frontend_thread);
+	if (__cs_etm__mem_access(etmq, address, size, buffer, 0, packet->el,
+				 tidq->frontend_thread) != size)
+		return -EIO;
+
+	return 0;
 }
 
 static u32 cs_etm__decoder_mem_access(struct cs_etm_queue *etmq, u8 trace_chan_id,
@@ -1370,9 +1373,12 @@ static inline int cs_etm__t32_instr_size(struct cs_etm_queue *etmq,
 					 struct cs_etm_packet *packet, u64 addr)
 {
 	u8 instrBytes[2] = { 0 };
+	int ret;
 
-	cs_etm__frontend_mem_access(etmq, tidq, packet, addr,
-				    ARRAY_SIZE(instrBytes), instrBytes);
+	ret = cs_etm__frontend_mem_access(etmq, tidq, packet, addr,
+					  ARRAY_SIZE(instrBytes), instrBytes);
+	if (ret)
+		return ret;
 	/*
 	 * T32 instruction size is indicated by bits[15:11] of the first
 	 * 16-bit word of the instruction: 0b11101, 0b11110 and 0b11111
@@ -1429,7 +1435,11 @@ static inline u64 cs_etm__instr_addr(struct cs_etm_queue *etmq,
 		return addr + offset * 4;
 
 	while (offset) {
-		addr += cs_etm__instr_size(etmq, tidq, packet, addr);
+		int size = cs_etm__instr_size(etmq, tidq, packet, addr);
+
+		if (size < 0)
+			return CS_ETM_INVAL_ADDR;
+		addr += size;
 		offset--;
 	}
 	return addr;
@@ -1560,31 +1570,31 @@ static void cs_etm__copy_insn(struct cs_etm_queue *etmq,
 			      struct cs_etm_packet *packet,
 			      struct perf_sample *sample)
 {
+	int size;
+
+	sample->insn_len = 0;
+
 	/*
 	 * It's pointless to read instructions for the CS_ETM_DISCONTINUITY
 	 * packet, so directly bail out with 'insn_len' = 0.
 	 */
-	if (packet->sample_type == CS_ETM_DISCONTINUITY) {
-		sample->insn_len = 0;
+	if (packet->sample_type == CS_ETM_DISCONTINUITY)
 		return;
-	}
 
-	sample->insn_len = cs_etm__instr_size(etmq, tidq, packet, sample->ip);
+	size = cs_etm__instr_size(etmq, tidq, packet, sample->ip);
 
 	/*
 	 * The instruction length should always fit within sample->insn,
 	 * but check it to prevent an out-of-bounds write.
 	 */
-	if (sample->insn_len > sizeof(sample->insn)) {
-		sample->insn_len = 0;
-		return;
-	}
-
-	if (packet->sample_type == CS_ETM_EXCEPTION && !sample->insn_len)
+	if (size <= 0 || (size_t)size > sizeof(sample->insn))
 		return;
 
-	cs_etm__frontend_mem_access(etmq, tidq, packet, sample->ip,
-				    sample->insn_len, (void *)sample->insn);
+	if (cs_etm__frontend_mem_access(etmq, tidq, packet, sample->ip,
+					size, (void *)sample->insn))
+		return;
+
+	sample->insn_len = size;
 }
 
 u64 cs_etm__convert_sample_time(struct cs_etm_queue *etmq, u64 cs_timestamp)
@@ -2011,11 +2021,13 @@ static int cs_etm__sample(struct cs_etm_queue *etmq,
 			 */
 			addr = cs_etm__instr_addr(etmq, tidq, tidq->packet,
 						  offset - 1);
-			ret = cs_etm__synth_instruction_sample(
-				etmq, tidq, tidq->packet, addr,
-				etm->instructions_sample_period);
-			if (ret)
-				return ret;
+			if (addr != CS_ETM_INVAL_ADDR) {
+				ret = cs_etm__synth_instruction_sample(
+					etmq, tidq, tidq->packet, addr,
+					etm->instructions_sample_period);
+				if (ret)
+					return ret;
+			}
 
 			offset += etm->instructions_sample_period;
 			tidq->period_instructions -=
@@ -2227,8 +2239,11 @@ static bool cs_etm__is_svc_instr(struct cs_etm_queue *etmq,
 		 * so below only read 2 bytes as instruction size for T32.
 		 */
 		addr = ret_addr - 2;
-		cs_etm__frontend_mem_access(etmq, tidq, packet, addr,
-					    sizeof(instr16), (u8 *)&instr16);
+
+		if (cs_etm__frontend_mem_access(etmq, tidq, packet, addr,
+						sizeof(instr16), (u8 *)&instr16))
+			return false;
+
 		if ((instr16 & 0xFF00) == 0xDF00)
 			return true;
 
@@ -2243,8 +2258,11 @@ static bool cs_etm__is_svc_instr(struct cs_etm_queue *etmq,
 		 * +---------+---------+-------------------------+
 		 */
 		addr = ret_addr - 4;
-		cs_etm__frontend_mem_access(etmq, tidq, packet, addr,
-					    sizeof(instr32), (u8 *)&instr32);
+
+		if (cs_etm__frontend_mem_access(etmq, tidq, packet, addr,
+						sizeof(instr32), (u8 *)&instr32))
+			return false;
+
 		if ((instr32 & 0x0F000000) == 0x0F000000 &&
 		    (instr32 & 0xF0000000) != 0xF0000000)
 			return true;
@@ -2260,8 +2278,11 @@ static bool cs_etm__is_svc_instr(struct cs_etm_queue *etmq,
 		 * +-----------------------+---------+-----------+
 		 */
 		addr = ret_addr - 4;
-		cs_etm__frontend_mem_access(etmq, tidq, packet, addr,
-					    sizeof(instr32), (u8 *)&instr32);
+
+		if (cs_etm__frontend_mem_access(etmq, tidq, packet, addr,
+						sizeof(instr32), (u8 *)&instr32))
+			return false;
+
 		if ((instr32 & 0xFFE0001F) == 0xd4000001)
 			return true;
 
