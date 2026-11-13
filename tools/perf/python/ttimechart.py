@@ -2,32 +2,46 @@
 # SPDX-License-Identifier: GPL-2.0
 """ttimechart.py - interactive perf timechart written using textual.
 
-Reads a perf.data file, typically created with 'perf timechart record', and
-displays per-CPU and per-task timelines in the terminal. Scheduler
-(sched:sched_switch, sched:sched_wakeup), power (power:cpu_idle,
-power:cpu_frequency) and I/O syscall (perf timechart record -I) tracepoints
-are understood. Unlike 'perf timechart', which writes an SVG file, the
-timeline can be zoomed, panned and queried interactively.
+Reads a perf.data file, typically created with 'perf timechart record', or
+records events in live mode, and displays per-CPU and per-task timelines in
+the terminal. Scheduler (sched:sched_switch, sched:sched_wakeup), power
+(power:cpu_idle, power:cpu_frequency) and I/O syscall (perf timechart record
+-I) tracepoints are understood. Unlike 'perf timechart', which writes an SVG
+file, the timeline can be zoomed, panned and queried interactively.
 
 Usage:
-    perf timechart record -- <workload>
+    perf timechart record [-I] -- <workload>
     perf timechart --tui
+    perf timechart --live [-I] [--window <seconds>] [-- <workload>]
 or:
     perf script ttimechart [-i perf.data]
+    perf script ttimechart -- --live [-I] [--window <seconds>] [-- <workload>]
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 import argparse
+import array
 import bisect
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, replace
+import fcntl
 import math
 import os
+import queue
+import select
+import shlex
+import shutil
+import signal
+import struct
+import subprocess
 import sys
+import tempfile
+import termios
 import threading
-from time import monotonic
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from time import monotonic, monotonic_ns
+from typing import (Any, Callable, Deque, Dict, List, Mapping, NoReturn, Optional, Sequence, Set,
+                    Tuple, Union)
 
 import perf
 from rich.segment import Segment
@@ -93,6 +107,23 @@ LABEL_WIDTH = 28
 BARS = " ▁▂▃▄▅▆▇█"
 NSEC_PER_SEC = 1_000_000_000
 
+# Default seconds of history kept and shown in live mode.
+LIVE_WINDOW = 10.0
+# Bounds on the seconds between refreshes of the live display. Within them
+# the time is adapted to the measured cost of a refresh, which reflects the
+# machine's speed and load, so that refreshing takes about
+# LIVE_REFRESH_FRACTION of the time and the rest is left for processing events.
+LIVE_MIN_REFRESH = 0.1
+LIVE_MAX_REFRESH = 2.0
+LIVE_REFRESH_FRACTION = 0.2
+# If processing events falls behind, refreshes are slowed by up to this factor.
+LIVE_MAX_BACKOFF = 8.0
+# Bounds on the seconds between asking perf record to read its buffers.
+LIVE_MIN_FLUSH = 0.05
+LIVE_MAX_FLUSH = 1.0
+# Size requested for the pipe of recorded data, to absorb bursts of events.
+LIVE_PIPE_SIZE = 1 << 20
+
 
 def fmt_duration(nsecs: float) -> str:
     """Format a duration in nanoseconds with an appropriate unit."""
@@ -141,19 +172,29 @@ class SegmentList:
     def __len__(self) -> int:
         return len(self.starts)
 
-    def add(self, start: int, end: int, key: int, data: Any = None) -> None:
-        """Append a segment, segments must be added in time order."""
+    def add(self, start: int, end: int, key: int, data: Any = None,
+            merge: bool = True) -> int:
+        """Append a segment, segments must be added in time order.
+
+        A segment continuing the last one with the same key and data extends
+        it when merge is true, such as when live mode closes a still open
+        state, see TimechartData.checkpoint(). Returns the duration added.
+        """
         if end <= start:
-            return
-        if self.ends and start < self.ends[-1]:
+            return 0
+        if self.ends and start <= self.ends[-1]:
+            if merge and start == self.ends[-1] and key == self.keys[-1] and data == self.data[-1]:
+                self.ends[-1] = end
+                return end - start
             # Clip overlaps caused by inconsistent data.
             start = self.ends[-1]
             if end <= start:
-                return
+                return 0
         self.starts.append(start)
         self.ends.append(end)
         self.keys.append(key)
         self.data.append(data)
+        return end - start
 
     def find(self, time: float) -> int:
         """Index of the segment containing time or -1."""
@@ -161,6 +202,21 @@ class SegmentList:
         if i >= 0 and time < self.ends[i]:
             return i
         return -1
+
+    def num_ending_by(self, time: float) -> int:
+        """Number of segments ending at or before time, which are the first ones."""
+        return bisect.bisect_right(self.ends, time)
+
+    def prune(self, time: int) -> None:
+        """Remove segments ending at or before time and clip any straddling time."""
+        num = self.num_ending_by(time)
+        if num:
+            del self.starts[:num]
+            del self.ends[:num]
+            del self.keys[:num]
+            del self.data[:num]
+        if self.starts and self.starts[0] < time:
+            self.starts[0] = time
 
     def last_before(self, time: float) -> int:
         """Index of the last segment starting at or before time or -1."""
@@ -233,9 +289,15 @@ class Task:
         self.io_pending: Optional[Tuple[int, int, int]] = None
         # Wakeups of this task as (time, waker tid) pairs.
         self.wakeups: List[Tuple[int, int]] = []
+        # Times when this task was switched out.
+        self.switch_times: List[int] = []
         self.totals = [0] * NUM_STATES
-        self.switches = 0
         self.io_bytes = 0
+
+    @property
+    def switches(self) -> int:
+        """Number of context switches out of this task in the kept history."""
+        return len(self.switch_times)
 
     def name(self) -> str:
         """Name for the task used in labels."""
@@ -245,17 +307,18 @@ class Task:
         """Update the task's command name."""
         if not comm or comm == self.comm:
             return
-        self.comm = comm
-        if comm not in self.comms:
+        if self.comms == [f"[{self.tid}]"]:
+            self.comms = [comm]
+        elif comm not in self.comms:
             self.comms.append(comm)
+        self.comm = comm
 
     def change_state(self, time: int, state: int, cpu: int = -1) -> None:
         """Record the current state as a segment and switch to a new state."""
         if self.state in (STATE_RUNNING, STATE_WAITING, STATE_BLOCKED) and time > self.since:
-            self.segs.add(self.since, time, self.state, self.cpu)
-            self.totals[self.state] += time - self.since
+            self.totals[self.state] += self.segs.add(self.since, time, self.state, self.cpu)
         self.state = state
-        self.since = time
+        self.since = max(self.since, time)
         if cpu >= 0:
             self.cpu = cpu
 
@@ -264,6 +327,34 @@ class Task:
         if not filters:
             return True
         return any(f == str(self.tid) or f in self.comms for f in filters)
+
+    def prune(self, time: int) -> None:
+        """Discard history ending at or before time, removing it from the totals."""
+        segs = self.segs
+        num = segs.num_ending_by(time)
+        for i in range(num):
+            self.totals[segs.keys[i]] -= segs.ends[i] - segs.starts[i]
+        if num < len(segs.starts) and segs.starts[num] < time:
+            self.totals[segs.keys[num]] -= time - segs.starts[num]
+        segs.prune(time)
+        io = self.io
+        for i in range(io.num_ending_by(time)):
+            ret = io.data[i][1]
+            if ret > 0 and io.keys[i] in (IOTYPE_READ, IOTYPE_WRITE, IOTYPE_TX, IOTYPE_RX):
+                self.io_bytes -= ret
+        io.prune(time)
+        if self.io_pending and self.io_pending[0] < time:
+            self.io_pending = (time, self.io_pending[1], self.io_pending[2])
+        del self.wakeups[:bisect.bisect_right(self.wakeups, (time, sys.maxsize))]
+        del self.switch_times[:bisect.bisect_right(self.switch_times, time)]
+        if self.since < time:
+            self.since = time
+
+    def is_empty(self) -> bool:
+        """Is there no history or pending state, so the task can be forgotten?"""
+        return (not self.segs and not self.io and not self.wakeups and
+                not self.switch_times and self.io_pending is None and
+                self.state in (STATE_SLEEPING, STATE_UNKNOWN))
 
 
 class Cpu:
@@ -280,6 +371,17 @@ class Cpu:
         # Frequency segments, key 1, with the frequency in kHz as data.
         self.pstate = SegmentList()
         self.pstate_cur: Optional[Tuple[int, int]] = None
+
+    def prune(self, time: int) -> None:
+        """Discard history ending at or before time."""
+        self.run.prune(time)
+        self.cstate.prune(time)
+        self.pstate.prune(time)
+        self.since = max(self.since, time)
+        if self.cstate_cur and self.cstate_cur[0] < time:
+            self.cstate_cur = (time, self.cstate_cur[1])
+        if self.pstate_cur and self.pstate_cur[0] < time:
+            self.pstate_cur = (time, self.pstate_cur[1])
 
 
 class LoadCancelled(Exception):
@@ -326,21 +428,90 @@ class TimechartData:
         self.progress: Optional[Callable[[], None]] = None
         self.start_progress = monotonic()
         self.last_progress = self.start_progress
+        # History before this time has been discarded, see prune().
+        self.pruned_to = 0
+        # Recording was paused until this time, see mark_gap().
+        self.resumed_at = 0
+        # Times when recording resumed after pauses; open states before each
+        # gap are closed once an event at or after it is processed, see mark_gap().
+        self.gaps: Deque[int] = deque()
+        # Process and thread IDs whose I/O events should be ignored.
+        self.ignore_pids: Set[int] = set()
 
     def has_events(self) -> bool:
         """Were any events that can be displayed processed?"""
         return bool(self.sched_events or self.power_events or self.io_events)
 
+    def start_time(self) -> int:
+        """Start of the history that is kept."""
+        return max(self.first_time, self.pruned_to)
+
+    def state_start(self) -> int:
+        """Start of the recorded history in which a state was first seen."""
+        return max(self.start_time(), self.resumed_at)
+
+    def mark_gap(self, time: int) -> None:
+        """Note that recording, paused for a while, resumes at time, the lock must be held.
+
+        Events weren't recorded while paused, so the states at the pause aren't
+        known to have continued. They are closed before the first event after
+        time is processed, the events are processed in time order.
+        """
+        if not self.gaps or time > self.gaps[-1]:
+            self.gaps.append(time)
+
+    def _close_gap(self, resumed_at: int) -> None:
+        """Close open states at the last event before the gap, see mark_gap()."""
+        end = self.last_time
+        for task in self.tasks.values():
+            task.change_state(end, STATE_UNKNOWN)
+            task.io_pending = None
+        for c in self.cpus.values():
+            if c.cur_tid > 0:
+                c.run.add(c.since, end, 1, c.cur_tid)
+            c.cur_tid = -1
+            if c.cstate_cur:
+                c.cstate.add(c.cstate_cur[0], end, 1, c.cstate_cur[1])
+                c.cstate_cur = None
+            if c.pstate_cur:
+                c.pstate.add(c.pstate_cur[0], end, 1, c.pstate_cur[1])
+                c.pstate_cur = None
+        self.resumed_at = resumed_at
+
+    def prune(self, time: int) -> None:
+        """Discard history ending at or before time, the lock must be held.
+
+        Live mode uses this to bound the memory used to the displayed window.
+        Tasks left without history are forgotten, if they run again they are
+        recreated.
+        """
+        if time <= self.pruned_to:
+            return
+        self.pruned_to = time
+        for c in self.cpus.values():
+            c.prune(time)
+        for tid, task in list(self.tasks.items()):
+            task.prune(time)
+            if task.is_empty():
+                del self.tasks[tid]
+
+    def session_comm(self, tid: int) -> Optional[str]:
+        """Current command name of tid in the session, ignoring unset ':tid' placeholders."""
+        if not self.session:
+            return None
+        try:
+            thread = self.session.find_thread(tid)
+            comm = thread.comm() if thread else None
+        except (OSError, ValueError, KeyError, RuntimeError, TypeError, AttributeError):
+            return None
+        return None if not comm or comm == f":{tid}" else comm
+
     def task(self, tid: int, comm: Optional[str] = None) -> Task:
         """Find or create a task."""
         task = self.tasks.get(tid)
+        if not comm:
+            comm = self.session_comm(tid)
         if task is None:
-            if not comm and self.session:
-                try:
-                    thread = self.session.find_thread(tid, tid)
-                    comm = thread.comm() if thread else None
-                except (OSError, ValueError, KeyError, RuntimeError, TypeError, AttributeError):
-                    comm = None
             task = Task(tid, comm or f"[{tid}]")
             self.tasks[tid] = task
         else:
@@ -363,9 +534,14 @@ class TimechartData:
         if c.cur_tid == -1 and prev_tid != 0:
             # Assume the task was running from the start of the trace.
             c.cur_tid = prev_tid
-            c.since = self.first_time
+            c.since = self.state_start()
         if c.cur_tid > 0:
             c.run.add(c.since, time, 1, c.cur_tid)
+            if c.cur_tid != prev_tid:
+                # The switch away from the task that was running was lost.
+                old = self.tasks.get(c.cur_tid)
+                if old and old.state == STATE_RUNNING and old.cpu == cpu:
+                    old.change_state(time, STATE_UNKNOWN)
         c.cur_tid = next_tid
         c.since = time
 
@@ -373,7 +549,9 @@ class TimechartData:
             prev = self.task(prev_tid, prev_comm)
             if prev.state == STATE_UNKNOWN:
                 prev.state = STATE_RUNNING
-                prev.since = self.first_time
+                # Not before history already recorded, such as when the task's
+                # switch out and back in were lost.
+                prev.since = max(prev.since, self.state_start())
                 prev.cpu = cpu
             # Ignore bits like TASK_REPORT_MAX used to report preemption.
             state = prev_state & 0xff
@@ -384,7 +562,10 @@ class TimechartData:
             else:
                 new_state = STATE_SLEEPING
             prev.change_state(time, new_state)
-            prev.switches += 1
+            if prev.switch_times and time < prev.switch_times[-1]:
+                bisect.insort(prev.switch_times, time)
+            else:
+                prev.switch_times.append(time)
 
         if next_tid != 0:
             nxt = self.task(next_tid, next_comm)
@@ -396,7 +577,10 @@ class TimechartData:
         if wakee == 0:
             return
         task = self.task(wakee, comm)
-        task.wakeups.append((time, waker))
+        if task.wakeups and time < task.wakeups[-1][0]:
+            bisect.insort(task.wakeups, (time, waker))
+        else:
+            task.wakeups.append((time, waker))
         if task.state in (STATE_UNKNOWN, STATE_SLEEPING, STATE_BLOCKED):
             task.change_state(time, STATE_WAITING)
 
@@ -429,23 +613,28 @@ class TimechartData:
         self.max_freq = max(self.max_freq, freq)
         self.min_freq = freq if not self.min_freq else min(self.min_freq, freq)
 
-    def io_enter(self, time: int, tid: int, iotype: int, fd: int) -> None:
+    def io_enter(self, time: int, tid: int, iotype: int, fd: int, pid: int = 0) -> None:
         """Entry to an I/O syscall."""
+        if tid in self.ignore_pids or (pid and pid in self.ignore_pids):
+            return
         self.io_events += 1
         self.task(tid).io_pending = (time, iotype, fd)
 
-    def io_exit(self, time: int, tid: int, iotype: int, ret: int) -> None:
+    def io_exit(self, time: int, tid: int, iotype: int, ret: int, pid: int = 0) -> None:
         """Exit from an I/O syscall."""
+        if tid in self.ignore_pids or (pid and pid in self.ignore_pids):
+            return
         self.io_events += 1
         task = self.task(tid)
         pending = task.io_pending
         task.io_pending = None
         if not pending or pending[1] != iotype:
             return
-        start = pending[0]
-        task.io.add(start, max(time, start + 1), iotype, (pending[2], ret))
-        if ret > 0 and iotype in (IOTYPE_READ, IOTYPE_WRITE, IOTYPE_TX, IOTYPE_RX):
-            task.io_bytes += ret
+        start = max(pending[0], task.io.ends[-1] if task.io.ends else 0)
+        if task.io.add(start, max(time, start + 1), iotype, (pending[2], ret),
+                       merge=False) > 0:
+            if ret > 0 and iotype in (IOTYPE_READ, IOTYPE_WRITE, IOTYPE_TX, IOTYPE_RX):
+                task.io_bytes += ret
 
     def _on_sched_switch(self, time: int, sample: perf.sample_event) -> None:
         self.sched_switch(time, sample.sample_cpu, sample.prev_pid,
@@ -497,40 +686,39 @@ class TimechartData:
         if name.startswith("syscalls:sys_enter_") and name[19:] in IO_SYSCALLS:
             iotype = IO_SYSCALLS[name[19:]]
             return lambda time, sample: self.io_enter(time, sample.sample_tid, iotype,
-                                                      getattr(sample, "fd", -1))
+                                                      getattr(sample, "fd", -1),
+                                                      getattr(sample, "sample_pid", 0))
         if name.startswith("syscalls:sys_exit_") and name[18:] in IO_SYSCALLS:
             iotype = IO_SYSCALLS[name[18:]]
             return lambda time, sample: self.io_exit(time, sample.sample_tid, iotype,
-                                                     sample.ret)
+                                                     sample.ret,
+                                                     getattr(sample, "sample_pid", 0))
         return None
 
     def process_event(self, sample: perf.sample_event) -> None:
         """Callback from perf.session for each sample."""
-        self.nr_samples += 1
-        if self.nr_samples % self.PROGRESS_INTERVAL == 0:
-            if self.cancelled:
-                raise LoadCancelled()
+        if self.cancelled:
+            raise LoadCancelled()
+        with self.lock:
+            if not self._process_event(sample):
+                return
+            samples = self.nr_samples
+        if samples % self.PROGRESS_INTERVAL == 0:
             now = monotonic()
             interval = min(max(self.PROGRESS_SECONDS,
                                (now - self.start_progress) * self.PROGRESS_FRACTION),
                            self.PROGRESS_MAX_SECONDS)
-            if self.progress and now - self.last_progress >= interval:
+            if now - self.last_progress >= interval:
                 with self.lock:
                     self.update_comms()
-                # Must not hold the lock as the callback may read the data.
-                self.progress()
+                if self.progress:
+                    # Must not hold the lock as the callback may read the data.
+                    self.progress()
                 # Time from when the callback, that may block, returns.
                 self.last_progress = monotonic()
-        with self.lock:
-            self._process_event(sample)
 
-    def _process_event(self, sample: perf.sample_event) -> None:
+    def _process_event(self, sample: perf.sample_event) -> bool:
         """Update the data from a sample, the lock must be held."""
-        time = sample.sample_time
-        if not self.first_time or time < self.first_time:
-            self.first_time = time
-        self.last_time = max(self.last_time, time)
-
         # Computing the evsel name and matching it is relatively expensive,
         # so cache the result by sample ID. Each ID belongs to a single evsel.
         sample_id = sample.sample_id
@@ -542,25 +730,63 @@ class TimechartData:
             cached = (name, self._handler_for(name))
             self._handlers[sample_id] = cached
         name, handler = cached
+        if self.ignore_pids and name.startswith("syscalls:"):
+            tid = sample.sample_tid
+            pid = getattr(sample, "sample_pid", 0)
+            if tid in self.ignore_pids or (pid and pid in self.ignore_pids):
+                return False
+
+        self.nr_samples += 1
+        time = sample.sample_time
+        if self.gaps and time >= self.gaps[0]:
+            resumed_at = self.gaps.popleft()
+            while self.gaps and time >= self.gaps[0]:
+                resumed_at = self.gaps.popleft()
+            self._close_gap(resumed_at)
+        if not self.first_time or time < self.first_time:
+            self.first_time = time
+        self.last_time = max(self.last_time, time)
+
         if handler is None:
             self.unhandled[name] += 1
-            return
+            return True
         try:
             handler(time, sample)
         except AttributeError:
             self.unhandled[name] += 1
+        return True
 
     def update_comms(self) -> None:
         """Refresh task command names from the session, the lock must be held."""
         if not self.session:
             return
         for tid, task in self.tasks.items():
-            try:
-                thread = self.session.find_thread(tid, tid)
-                if thread:
-                    task.set_comm(thread.comm())
-            except (OSError, ValueError, KeyError, RuntimeError, TypeError, AttributeError):
-                pass
+            task.set_comm(self.session_comm(tid))
+
+    def checkpoint(self) -> None:
+        """Extend open task, CPU, idle and frequency states to last_time.
+
+        Live mode calls this before displaying and pruning so that states that
+        haven't changed recently are shown up to the latest event, rather than
+        only once they end. The lock must be held.
+        """
+        end = self.last_time
+        if not end:
+            return
+        for task in self.tasks.values():
+            if task.state in (STATE_RUNNING, STATE_WAITING, STATE_BLOCKED) and end > task.since:
+                task.totals[task.state] += task.segs.add(task.since, end, task.state, task.cpu)
+                task.since = end
+        for c in self.cpus.values():
+            if c.cur_tid > 0 and end > c.since:
+                c.run.add(c.since, end, 1, c.cur_tid)
+                c.since = end
+            if c.cstate_cur and end > c.cstate_cur[0]:
+                c.cstate.add(c.cstate_cur[0], end, 1, c.cstate_cur[1])
+                c.cstate_cur = (end, c.cstate_cur[1])
+            if c.pstate_cur and end > c.pstate_cur[0]:
+                c.pstate.add(c.pstate_cur[0], end, 1, c.pstate_cur[1])
+                c.pstate_cur = (end, c.pstate_cur[1])
 
     def finish(self) -> None:
         """Close open segments at the end of the trace."""
@@ -604,16 +830,17 @@ class TimechartData:
                        if len(t.io) and t.passes_filter(filters)),
                       key=lambda t: -len(t.io))
 
-    def dump(self, power_only: bool, tasks_only: bool, filters: Sequence[str]) -> None:
+    def dump(self, power_only: bool, tasks_only: bool, filters: Sequence[str],
+             io_only: bool = False) -> None:
         """Print a plain text summary, for use without a terminal UI."""
         duration = self.last_time - self.first_time
         span = max(duration, 1)
-        tasks = self.sched_tasks(filters)
+        tasks = [] if io_only else self.sched_tasks(filters)
         io_tasks = self.io_tasks(filters)
         print(f"Duration: {fmt_duration(duration)}, CPUs: {len(self.cpus)}, "
               f"tasks: {len(tasks) or len(io_tasks)}, sched events: {self.sched_events}, "
               f"power events: {self.power_events}, I/O events: {self.io_events}")
-        if not tasks_only:
+        if not tasks_only and not io_only:
             for c in sorted(self.cpus.values(), key=lambda c: c.cpu):
                 busy = sum(e - s for s, e in zip(c.run.starts, c.run.ends))
                 print(f"CPU {c.cpu}: busy {busy * 100 / span:.1f}%, "
@@ -621,14 +848,15 @@ class TimechartData:
                       f"{len(c.pstate)} frequency periods")
         if power_only:
             return
-        print(f"{'Task':<24} {'TID':>8} {'Running':>12} {'Waiting':>12} {'Blocked':>12} "
-              f"{'Switches':>9} {'Wakeups':>8}")
-        for task in sorted(tasks, key=lambda t: -t.totals[STATE_RUNNING]):
-            print(f"{task.comm[:24]:<24} {task.tid:>8} "
-                  f"{fmt_duration(task.totals[STATE_RUNNING]):>12} "
-                  f"{fmt_duration(task.totals[STATE_WAITING]):>12} "
-                  f"{fmt_duration(task.totals[STATE_BLOCKED]):>12} "
-                  f"{task.switches:>9} {len(task.wakeups):>8}")
+        if not io_only:
+            print(f"{'Task':<24} {'TID':>8} {'Running':>12} {'Waiting':>12} {'Blocked':>12} "
+                  f"{'Switches':>9} {'Wakeups':>8}")
+            for task in sorted(tasks, key=lambda t: -t.totals[STATE_RUNNING]):
+                print(f"{task.comm[:24]:<24} {task.tid:>8} "
+                      f"{fmt_duration(task.totals[STATE_RUNNING]):>12} "
+                      f"{fmt_duration(task.totals[STATE_WAITING]):>12} "
+                      f"{fmt_duration(task.totals[STATE_BLOCKED]):>12} "
+                      f"{task.switches:>9} {len(task.wakeups):>8}")
         for task in io_tasks:
             print(f"I/O {task.name()}: {len(task.io)} syscalls, {task.io_bytes} bytes")
 
@@ -1124,11 +1352,12 @@ class TimelineView(ScrollView):
         elif self.selected >= scroll_y + visible:
             self.scroll_to(y=self.selected - visible + 1, animate=False)
 
-    def set_window(self, window: TimeWindow) -> None:
+    def set_window(self, window: TimeWindow, *, follow: bool = False,
+                   move_cursor: bool = False) -> None:
         """Change the window shared by all views, owned by the app."""
         app = self.app
         if isinstance(app, TimechartApp):
-            app.window = window
+            app.user_window(window, follow=follow, move_cursor=move_cursor)
 
     def ruler(self, width: int) -> Strip:
         """The time axis, labeled in seconds relative to the trace start."""
@@ -1213,7 +1442,7 @@ class TimelineView(ScrollView):
     def on_click(self, click: events.Click) -> None:
         """Select the clicked row and move the cursor to the clicked time."""
         if click.x >= LABEL_WIDTH:
-            self.set_window(self.window.with_cursor(self.column_time(click.x)))
+            self.set_window(self.window.with_cursor(self.column_time(click.x)), move_cursor=True)
         if click.y > 0:
             _, scroll_y = self.scroll_offset
             self.selected = scroll_y + click.y - 1
@@ -1237,12 +1466,14 @@ class TimelineView(ScrollView):
     def action_cursor_left(self) -> None:
         """Move the cursor one column left."""
         win = self.window
-        self.set_window(win.with_cursor(win.cursor - win.span() / self.timeline_width()))
+        self.set_window(win.with_cursor(win.cursor - win.span() / self.timeline_width()),
+                        move_cursor=True)
 
     def action_cursor_right(self) -> None:
         """Move the cursor one column right."""
         win = self.window
-        self.set_window(win.with_cursor(win.cursor + win.span() / self.timeline_width()))
+        self.set_window(win.with_cursor(win.cursor + win.span() / self.timeline_width()),
+                        move_cursor=True)
 
     def action_pan_left(self) -> None:
         """Pan a quarter of the view left."""
@@ -1262,7 +1493,7 @@ class TimelineView(ScrollView):
 
     def action_zoom_reset(self) -> None:
         """Show the whole trace."""
-        self.set_window(self.window.reset())
+        self.set_window(self.window.reset(), follow=True)
 
     def action_next_change(self) -> None:
         """Move the cursor to the next change in the selected row."""
@@ -1274,7 +1505,7 @@ class TimelineView(ScrollView):
                 time = row.segments().next_change(
                     win.cursor + win.span() / self.timeline_width() / 2)
             if time is not None:
-                self.set_window(win.with_cursor(time))
+                self.set_window(win.with_cursor(time), move_cursor=True)
 
     def action_prev_change(self) -> None:
         """Move the cursor to the previous change in the selected row."""
@@ -1285,7 +1516,7 @@ class TimelineView(ScrollView):
                 time = row.segments().prev_change(
                     win.cursor - win.span() / self.timeline_width() / 2)
             if time is not None:
-                self.set_window(win.with_cursor(time))
+                self.set_window(win.with_cursor(time), move_cursor=True)
 
 
 class TimechartApp(App):
@@ -1296,6 +1527,8 @@ class TimechartApp(App):
         Binding("s", "sort", "Sort tasks", tooltip="Cycle task sort order"),
         Binding("w", "goto_waker", "Go to waker",
                 tooltip="Select the task that last woke the selected task"),
+        Binding("space", "toggle_pause", "Pause/resume", key_display="space",
+                tooltip="Pause or resume live recording"),
         Binding(key="^q", action="quit", description="Quit", tooltip="Quit the app"),
     ]
 
@@ -1325,15 +1558,20 @@ class TimechartApp(App):
     sort_order: reactive[int] = reactive(0, init=False)
 
     def __init__(self, input_name: str, power_only: bool, tasks_only: bool,
-                 filters: Sequence[str], data: Optional[TimechartData] = None) -> None:
+                 filters: Sequence[str], data: Optional[TimechartData] = None,
+                 live: Optional[LiveRecorder] = None, window: float = LIVE_WINDOW,
+                 io_only: bool = False) -> None:
         """Create the app, if data isn't given it is loaded from input_name.
 
-        While the data is loading the views show what has been read so far.
+        While the data is loading the views show what has been read so far. In
+        live mode the data is read from the started recorder and only the last
+        window seconds of it are kept.
         """
         super().__init__()
         self.input_name = input_name
         self.power_only = power_only
         self.tasks_only = tasks_only
+        self.io_only = io_only
         self.filters = filters
         # The data being displayed, possibly still being loaded.
         self.data = data if data else TimechartData()
@@ -1349,6 +1587,29 @@ class TimechartApp(App):
         # Does the summary table need updating before it is next shown?
         self.summary_stale = True
         self.theme_colors = ThemeColors(self.theme_variables)
+        # Live mode state.
+        self.live = live
+        self.live_window = int(window * NSEC_PER_SEC)
+        # Is perf record still running?
+        self.recording = live is not None
+        # CLOCK_MONOTONIC time when paused, or 0.
+        self.paused_at = 0
+        # CLOCK_MONOTONIC time when recording finished, or 0.
+        self.finished_at = 0
+        # Does the view follow the latest events? Zooming or panning stops it.
+        self.following = True
+        self.follow_cursor = True
+        # Seconds between refreshes, adapted to their cost, see tune_refresh().
+        self.refresh_interval = LIVE_MIN_REFRESH
+        self.refresh_cost = 0.0
+        self.backoff = 1.0
+        self.refreshed_samples = -1
+        if live:
+            self.data.first_time = live.origin
+            self.data.ignore_pids.add(os.getpid())
+            proc = getattr(live, "proc", None)
+            if proc:
+                self.data.ignore_pids.add(proc.pid)
 
     def cached_row(self, cls: Callable[[TimechartData, Any], Row], num: int, obj: Any) -> Row:
         """Find or create the row of type cls for the CPU or task obj numbered num."""
@@ -1388,17 +1649,18 @@ class TimechartApp(App):
         """Composes the user interface of the application."""
         yield Header()
         with TabbedContent():
-            if not self.tasks_only:
+            if not self.tasks_only and not self.io_only:
                 with TabPane("CPUs", id="cpus"):
                     yield Static(id="cpus_legend", classes="legend")
                     yield TimelineView(self.data, [],
                                        id="cpus_view").data_bind(TimechartApp.window)
             if not self.power_only:
-                with TabPane("Tasks", id="tasks"):
-                    yield Static(id="tasks_legend", classes="legend")
-                    yield TimelineView(self.data, [],
-                                       id="tasks_view").data_bind(TimechartApp.window)
-                # Hidden until there are tasks doing I/O.
+                if not self.io_only:
+                    with TabPane("Tasks", id="tasks"):
+                        yield Static(id="tasks_legend", classes="legend")
+                        yield TimelineView(self.data, [],
+                                           id="tasks_view").data_bind(TimechartApp.window)
+                # Hidden until there are tasks doing I/O, unless in I/O-only mode.
                 with TabPane("I/O", id="io"):
                     yield Static(id="io_legend", classes="legend")
                     yield TimelineView(self.data, [],
@@ -1418,6 +1680,11 @@ class TimechartApp(App):
             view.focus()
         if self.loaded:
             self.finish_loading()
+        elif self.live:
+            self.update_live_status()
+            self.loading = self.data
+            self.record_events()
+            self.set_timer(self.refresh_interval, self.live_refresh)
         else:
             self.sub_title = f"Loading {self.input_name}"
             self.loading = self.data
@@ -1486,6 +1753,219 @@ class TimechartApp(App):
             return
         self.call_from_thread(self.data_loaded)
 
+    @work(thread=True, exclusive=True)
+    def record_events(self) -> None:
+        """Process events from perf record as they arrive, until it exits.
+
+        Unlike loading a file, the views are refreshed by live_refresh() on a
+        timer, as events may arrive slowly.
+        """
+        data = self.loading or self.data
+        live = self.live
+        assert live
+        self.loading = data
+        error = None
+        try:
+            read_events(data, live.data_fd)
+        except LoadCancelled:
+            return
+        except (OSError, ValueError, RuntimeError) as e:
+            error = f"Error processing the recorded events: {e}"
+        finally:
+            self.loading = None
+            live.stop()
+        if data.cancelled:
+            return
+        if error or not data.has_events():
+            details = live.error_text()
+            if not data.has_events() and details:
+                msg = f"Error: perf record failed:\n{details}"
+            else:
+                msg = error or "Error: no scheduler, power or I/O events were recorded."
+                if details:
+                    msg = f"{msg}\n{details}"
+            try:
+                self.call_from_thread(self.exit, None, 1, msg)
+            except RuntimeError:
+                pass
+            return
+        try:
+            self.call_from_thread(self.recording_finished)
+        except RuntimeError:
+            # The app is no longer running.
+            pass
+
+    def recording_finished(self) -> None:
+        """Called on the UI thread when perf record exits, such as when the workload ends."""
+        # Keep showing the window at the end of recording, or when paused,
+        # which is after the history already discarded.
+        self.finished_at = self.paused_at or monotonic_ns()
+        self.data.finish()
+        self.recording = False
+        self.paused_at = 0
+        self.loaded = True
+        with self.data.lock:
+            # Discard history from events flushed when perf record exited.
+            self.live_prune()
+        self.refresh_bindings()
+        self.update_views()
+        self.update_live_status()
+
+    def live_bounds(self) -> Tuple[int, int]:
+        """The time range kept and shown in live mode, the last window of the recording.
+
+        Until a window of time has been recorded the range is the first window,
+        so the timeline fills from the left, after that it moves with time.
+        """
+        assert self.live
+        if self.paused_at:
+            now = self.paused_at
+        elif self.recording:
+            now = monotonic_ns()
+        else:
+            now = self.finished_at
+        last = max(now, self.live.origin + self.live_window)
+        return max(self.live.origin, last - self.live_window), last
+
+    def live_prune(self) -> None:
+        """Discard history before the live window, the data's lock must be held.
+
+        Open states are only extended up to the last event, see checkpoint(),
+        so the last event isn't pruned. Otherwise, when events haven't been
+        seen for a window, open states extended to last_time would be lost.
+        """
+        if self.data.last_time > 0:
+            self.data.prune(min(self.live_bounds()[0], self.data.last_time - 1))
+            self.prune_rows()
+
+    def live_refresh(self) -> None:
+        """Show newly recorded events and discard those no longer in the window."""
+        start = monotonic()
+        refresh = False
+        with self.data.lock:
+            # When paused, once the buffered events are shown there's nothing new.
+            if not self.paused_at or self.data.nr_samples != self.refreshed_samples:
+                self.refreshed_samples = self.data.nr_samples
+                self.data.checkpoint()
+                if self.recording and not self.paused_at:
+                    self.live_prune()
+                refresh = True
+        if refresh:
+            self.update_views()
+            self.update_live_status()
+        # Measure the cost of the refresh including drawing the screen.
+        self.call_after_refresh(self.live_refreshed, start)
+
+    def live_refreshed(self, start: float) -> None:
+        """Schedule the next refresh after the screen is drawn."""
+        if not self.recording:
+            return
+        self.tune_refresh(monotonic() - start)
+        self.set_timer(self.refresh_interval, self.live_refresh)
+
+    def tune_refresh(self, cost: float) -> None:
+        """Adapt the time between refreshes, and flushes, to the machine and its load.
+
+        The cost of a refresh grows with the number of events shown, the
+        speed of the machine and how loaded it is, including by processing
+        events in the other thread. The time between refreshes is chosen so
+        that refreshing takes about LIVE_REFRESH_FRACTION of the time. If data
+        builds up in the pipe then processing events is falling behind, so
+        refreshes are slowed further to give it more time.
+        """
+        assert self.live
+        self.refresh_cost = cost if not self.refresh_cost else \
+            0.7 * self.refresh_cost + 0.3 * cost
+        if self.live.backlog() > 0.25:
+            self.backoff = min(self.backoff * 1.5, LIVE_MAX_BACKOFF)
+        else:
+            self.backoff = max(self.backoff / 1.25, 1.0)
+        interval = self.refresh_cost / LIVE_REFRESH_FRACTION * self.backoff
+        self.refresh_interval = min(max(interval, LIVE_MIN_REFRESH), LIVE_MAX_REFRESH)
+        # Events are only processed once a later flush shows that the
+        # earlier ones have all been read, so flush twice per refresh.
+        self.live.flush_interval = min(max(self.refresh_interval / 2, LIVE_MIN_FLUSH),
+                                       LIVE_MAX_FLUSH)
+
+    def prune_rows(self) -> None:
+        """Forget the rows of tasks that the data forgot, the data's lock must be held."""
+        tasks = self.data.tasks
+        self.row_cache = {key: row for key, row in self.row_cache.items()
+                          if not isinstance(row, (TaskRow, IoRow)) or
+                          tasks.get(row.task.tid) is row.task}
+
+    def update_live_status(self) -> None:
+        """Describe the state of live recording in the sub-title."""
+        if self.paused_at:
+            state = "❚❚ Paused (space to resume)"
+        elif not self.recording:
+            state = "Finished"
+        elif self.following and self.follow_cursor:
+            state = "● Live"
+        else:
+            state = "● Live (not following, press 0 to follow)"
+        data = self.data
+        with data.lock:
+            nr_samples = data.nr_samples
+            nr_cpus = len(data.cpus)
+        nr_tasks = len(self.tasks) or len(self.io_tasks)
+        self.sub_title = (f"{state}: {nr_samples:,} events, {nr_cpus} CPUs, "
+                          f"{nr_tasks} tasks, refreshing every "
+                          f"{self.refresh_interval * 1000:.0f}ms")
+
+    def check_action(self, action: str, parameters: Tuple[object, ...]) -> Optional[bool]:
+        """Only show pausing while live recording."""
+        if action == "toggle_pause":
+            return self.recording
+        return True
+
+    def action_toggle_pause(self) -> None:
+        """Pause or resume live recording, resuming shows the latest events again."""
+        if not self.live or not self.recording:
+            return
+        if self.paused_at:
+            self.paused_at = 0
+            self.following = True
+            self.follow_cursor = True
+            with self.data.lock:
+                # Events after this are recorded once perf record is enabled.
+                self.data.mark_gap(monotonic_ns())
+        else:
+            self.paused_at = monotonic_ns()
+        self.live.set_paused(bool(self.paused_at))
+        self.update_views()
+        self.update_live_status()
+
+    def user_window(self, window: TimeWindow, *, follow: bool = False,
+                    move_cursor: bool = False) -> None:
+        """Change the window for the user.
+
+        In live mode, zooming or panning so that the whole window isn't shown
+        stops the view and cursor following the latest events, and moving the
+        cursor stops the cursor following until zoom is reset with '0'.
+        """
+        if self.live:
+            whole = window.start == window.first and window.end == window.last
+            was_following = self.following and self.follow_cursor
+            if not whole:
+                self.follow_cursor = False
+            elif follow:
+                self.follow_cursor = True
+            elif move_cursor or window.cursor != self.window.cursor:
+                self.follow_cursor = False
+            elif not self.following:
+                self.follow_cursor = True
+            self.following = whole
+            if self.follow_cursor and not was_following:
+                with self.data.lock:
+                    last = self.data.last_time
+                if last:
+                    window = replace(window, cursor=min(max(last, window.first),
+                                                        window.last))
+            if (self.following and self.follow_cursor) != was_following:
+                self.update_live_status()
+        self.window = window
+
     def data_loaded(self) -> None:
         """Called on the UI thread when loading completes."""
         self.loaded = True
@@ -1512,10 +1992,15 @@ class TimechartApp(App):
                           f"{len(self.data.cpus)} CPUs, {nr_tasks} tasks")
 
     def cancel_loading(self) -> None:
-        """Stop a background load, the worker notices at the next progress interval."""
+        """Stop a background load, the worker notices at the next progress interval.
+
+        In live mode stop perf record, the worker then sees the end of the data.
+        """
         loading = self.loading
         if loading is not None:
             loading.cancelled = True
+        if self.live:
+            self.live.stop()
 
     async def action_quit(self) -> None:
         """Quit, stopping any background load."""
@@ -1556,11 +2041,11 @@ class TimechartApp(App):
         data = self.data
         with data.lock:
             first, last = data.first_time, data.last_time
-            self.tasks = data.sched_tasks(self.filters)
+            self.tasks = [] if self.io_only else data.sched_tasks(self.filters)
             self.io_tasks = data.io_tasks(self.filters)
             all_rows = {
-                "cpus_view": self.cpu_rows(),
-                "tasks_view": self.task_rows(),
+                "cpus_view": [] if self.tasks_only or self.io_only else self.cpu_rows(),
+                "tasks_view": [] if self.power_only or self.io_only else self.task_rows(),
                 "io_view": [self.cached_row(IoRow, t.tid, t) for t in self.io_tasks],
             }
             legend = self.cpu_legend()
@@ -1569,14 +2054,23 @@ class TimechartApp(App):
                 view.set_rows(rows)
         for static in self.query("#cpus_legend").results(Static):
             static.update(legend)
-        if self.query("#io") and bool(self.io_tasks) != self.io_tab_shown:
-            self.io_tab_shown = bool(self.io_tasks)
+        show_io = bool(self.io_tasks) or self.io_only
+        if self.query("#io") and show_io != self.io_tab_shown:
+            self.io_tab_shown = show_io
             tabbed = self.query_one(TabbedContent)
             if self.io_tab_shown:
                 tabbed.show_tab("io")
             else:
                 tabbed.hide_tab("io")
-        if first or last:
+        if self.live:
+            live_first, live_last = self.live_bounds()
+            win = self.window.extend(live_first, live_last)
+            if self.following:
+                win = win.reset()
+            if self.follow_cursor and last:
+                win = replace(win, cursor=min(max(last, live_first), live_last))
+            self.window = win
+        elif first or last:
             self.window = self.window.extend(first, last)
         self.summary_stale = True
         tabs = self.query(TabbedContent)
@@ -1651,7 +2145,8 @@ class TimechartApp(App):
             with self.data.lock:
                 text += row.describe(win.cursor, win.start, win.end)
         elif view is None:
-            text += "Select a task and press enter to show it in the Tasks timeline"
+            tab = "I/O" if self.io_only or (not self.tasks and self.io_tasks) else "Tasks"
+            text += f"Select a task and press enter to show it in the {tab} timeline"
         details.first(Static).update(text)
 
     @on(TabbedContent.TabActivated)
@@ -1685,11 +2180,12 @@ class TimechartApp(App):
                 if isinstance(row, (TaskRow, IoRow)) and row.task.tid == tid:
                     self.query_one(TabbedContent).active = tab_id
                     if time is not None:
-                        self.window = self.window.with_cursor(time)
+                        self.user_window(self.window.with_cursor(time), move_cursor=True)
                     view.selected = idx
                     view.focus()
                     return
-        self.notify(f"Task {tid} isn't shown in the tasks view", severity="warning")
+        view_name = "I/O" if self.io_only else "tasks"
+        self.notify(f"Task {tid} isn't shown in the {view_name} view", severity="warning")
 
     def action_sort(self) -> None:
         """Cycle the sort order of the tasks view."""
@@ -1726,52 +2222,662 @@ class TimechartApp(App):
         self.goto_task(waker, wake_time)
 
 
+class PerfPipeTracker:
+    """Tracks record boundaries and unflushed rounds in a perf pipe stream.
+
+    perf.session buffers each round of sample and task events in ordered_events
+    until a subsequent PERF_RECORD_FINISHED_ROUND advances and flushes the
+    queue. Tracking record boundaries allows LiveRecorder to inject a synthetic
+    PERF_RECORD_FINISHED_ROUND when perf record goes idle or pauses.
+    """
+    PERF_MAGIC = 0x32454c4946524550
+    USER_TYPE_START = 64
+    HEADER_TRACING_DATA = 66
+    FINISHED_ROUND = 68
+    AUXTRACE = 71
+    COMPRESSED = (81, 83)
+    FINISHED_ROUND_EVENT = struct.pack("=IHH", FINISHED_ROUND, 0, 8)
+
+    def __init__(self) -> None:
+        self.valid = True
+        self.in_file_hdr = True
+        self.skip = 0
+        self.head = bytearray()
+        self.queued = False
+        self.unflushed_round = False
+        self.rounds = 0
+
+    def feed(self, buf: bytes) -> None:
+        """Advance past buf in the pipe stream."""
+        if not self.valid:
+            return
+        view = memoryview(buf)
+        pos = 0
+        end = len(view)
+        while pos < end:
+            if self.skip:
+                step = min(self.skip, end - pos)
+                self.skip -= step
+                pos += step
+                continue
+            need = 16 if self.in_file_hdr else 8
+            if len(self.head) < need:
+                take = min(need - len(self.head), end - pos)
+                self.head += view[pos:pos + take]
+                pos += take
+                if len(self.head) < need:
+                    return
+            if self.in_file_hdr:
+                magic, hdr_size = struct.unpack_from("=QQ", self.head)
+                self.head.clear()
+                if magic != self.PERF_MAGIC or hdr_size < 16:
+                    self.valid = False
+                    return
+                self.in_file_hdr = False
+                self.skip = hdr_size - 16
+                continue
+            ev_type, _, ev_size = struct.unpack_from("=IHH", self.head)
+            if ev_size < 8:
+                self.valid = False
+                return
+            extra_hdr = 0
+            if ev_type == self.HEADER_TRACING_DATA:
+                extra_hdr = 12
+            elif ev_type == self.AUXTRACE:
+                extra_hdr = 16
+            if extra_hdr and len(self.head) < extra_hdr:
+                if ev_size < extra_hdr:
+                    self.valid = False
+                    return
+                take = min(extra_hdr - len(self.head), end - pos)
+                self.head += view[pos:pos + take]
+                pos += take
+                if len(self.head) < extra_hdr:
+                    return
+            consumed = len(self.head)
+            extra = 0
+            if ev_type == self.HEADER_TRACING_DATA:
+                (extra,) = struct.unpack_from("=I", self.head, 8)
+            elif ev_type == self.AUXTRACE:
+                (extra,) = struct.unpack_from("=Q", self.head, 8)
+            elif ev_type < self.USER_TYPE_START or ev_type in self.COMPRESSED:
+                self.queued = True
+            elif ev_type == self.FINISHED_ROUND:
+                self.rounds += 1
+                self.unflushed_round = self.queued
+                self.queued = False
+            self.head.clear()
+            self.skip = ev_size - consumed + extra
+
+    def at_boundary(self) -> bool:
+        """Is the stream at a record boundary where an event may be inserted?"""
+        return self.valid and not self.in_file_hdr and self.skip == 0 and not self.head
+
+
+class LiveRecorder:
+    """Runs 'perf record' writing events to a pipe for live display.
+
+    perf record is controlled through its --control file descriptors. It only
+    reads its ring buffers when a watermark is reached, so a periodic 'ping'
+    makes it read them, bounding the delay before events are displayed.
+    'disable' and 'enable' pause and resume recording. Timestamps use
+    CLOCK_MONOTONIC so that they can be compared with the current time.
+    """
+    def __init__(self, perf_exe: str, power_only: bool, tasks_only: bool,
+                 workload: Sequence[str], output: Optional[str],
+                 io_only: bool = False) -> None:
+        self.perf_exe = perf_exe
+        self.power_only = power_only
+        self.tasks_only = tasks_only
+        self.io_only = io_only
+        self.workload = list(workload)
+        self.output = output
+        self.proc: Optional[subprocess.Popen] = None
+        # perf record's stderr, and the workload's output, to explain errors.
+        self.stderr = tempfile.TemporaryFile()
+        self.ctl_fd = -1
+        self.ack_fd = -1
+        self.wake_r = -1
+        self.wake_w = -1
+        # Read end of the pipe that the recorded data is processed from.
+        self.data_fd = -1
+        # Read end of the pipe from the pump thread.
+        self.tee_r = -1
+        # CLOCK_MONOTONIC time in nanoseconds when recording started.
+        self.origin = 0
+        # Seconds between flushes of perf record's buffers, tuned by the app.
+        self.flush_interval = LIVE_MIN_REFRESH / 2
+        self.paused = False
+        # Commands to send from the control thread, see control_loop().
+        self.commands: queue.Queue[str] = queue.Queue()
+        self.stopping = threading.Event()
+        self.fd_lock = threading.Lock()
+        # Serializes stop() calls from different threads.
+        self.stop_lock = threading.Lock()
+        self.round_lock = threading.Lock()
+        self.tracker = PerfPipeTracker()
+        # Round number to flush once src is drained, -1 when paused, or None.
+        self.flush_round_target: Optional[int] = None
+        self.flush_seq = 0
+        self.saved_comm: Optional[str] = None
+        self.control_thread: Optional[threading.Thread] = None
+        self.pump_thread: Optional[threading.Thread] = None
+
+    def close_control_fds(self) -> None:
+        """Close the control and acknowledgment pipe file descriptors."""
+        if (self.control_thread and self.control_thread is not threading.current_thread() and
+                self.control_thread.is_alive()):
+            return
+        with self.fd_lock:
+            ctl_fd, self.ctl_fd = self.ctl_fd, -1
+            ack_fd, self.ack_fd = self.ack_fd, -1
+            for fd in (ctl_fd, ack_fd):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+    def wake_pump(self) -> None:
+        """Wake the pump thread from select()."""
+        with self.fd_lock:
+            if self.wake_w >= 0:
+                try:
+                    os.write(self.wake_w, b"\x00")
+                except OSError:
+                    pass
+
+    def drain_wake(self) -> None:
+        """Discard wakeup bytes read by the pump thread."""
+        while True:
+            try:
+                if not os.read(self.wake_r, 64):
+                    break
+            except OSError:
+                break
+
+    def close_wake_fds(self) -> None:
+        """Close the pump wakeup pipe file descriptors."""
+        if self.pump_thread and self.pump_thread.is_alive():
+            return
+        with self.fd_lock:
+            wake_r, self.wake_r = self.wake_r, -1
+            wake_w, self.wake_w = self.wake_w, -1
+            for fd in (wake_r, wake_w):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+    def set_own_comm(self) -> Optional[str]:
+        """Set a distinct comm on all threads in this process for tracepoint filtering."""
+        comm = f"ttimechart:{os.getpid() & 0xffff:x}"
+        try:
+            with open("/proc/self/comm", encoding="utf-8") as fp:
+                self.saved_comm = fp.read().rstrip("\n")
+            for tid in os.listdir("/proc/self/task"):
+                try:
+                    with open(f"/proc/self/task/{tid}/comm", "w", encoding="utf-8") as fp:
+                        fp.write(comm)
+                except OSError:
+                    pass
+            with open("/proc/self/comm", encoding="utf-8") as fp:
+                if fp.read().rstrip("\n") == comm:
+                    return comm
+        except OSError:
+            pass
+        return None
+
+    def restore_own_comm(self) -> None:
+        """Restore the process comm changed by set_own_comm()."""
+        if self.saved_comm is None:
+            return
+        saved, self.saved_comm = self.saved_comm, None
+        try:
+            with open("/proc/self/comm", "w", encoding="utf-8") as fp:
+                fp.write(saved)
+        except OSError:
+            pass
+
+    def events(self) -> List[str]:
+        """Tracepoints to record, those that the kernel lacks are skipped."""
+        if self.io_only:
+            names = [f"syscalls:sys_{direction}_{sc}"
+                     for sc in IO_SYSCALLS
+                     for direction in ("enter", "exit")]
+        else:
+            names = []
+            if not self.power_only:
+                names += ["sched:sched_switch", "sched:sched_wakeup", "sched:sched_wakeup_new"]
+            if not self.tasks_only:
+                names += ["power:cpu_idle", "power:cpu_frequency"]
+        present = [n for n in names if perf.tracepoint(*n.split(":")) >= 0]
+        # If none are found tracefs may not be readable, let perf record
+        # report the problem.
+        return present or names
+
+    def start(self) -> None:
+        """Start perf record, the data is then read from data_fd."""
+        output = open(self.output, "wb") if self.output else None
+        # perf record's ends of the control pipes, closed once it is started.
+        child_fds: List[int] = []
+        try:
+            ctl_r, self.ctl_fd = os.pipe()
+            child_fds.append(ctl_r)
+            self.ack_fd, ack_w = os.pipe()
+            child_fds.append(ack_w)
+            self.wake_r, self.wake_w = os.pipe()
+            os.set_blocking(self.wake_r, False)
+            os.set_blocking(self.wake_w, False)
+            ev_names = self.events()
+            if any(name.startswith("syscalls:") for name in ev_names):
+                own_comm = self.set_own_comm()
+                # common_pid is a thread ID; matching comm excludes all threads
+                # of this process, and $$ excludes the perf record process that
+                # replaces sh via exec. Pass self_filt as a positional argument
+                # so the shell preserves the quotes around own_comm.
+                self_filt = (f'comm != "{own_comm}"' if own_comm else
+                             f"common_pid != {os.getpid()}")
+                ev_args = " ".join(
+                    f'-e {shlex.quote(name)} --filter "$filt"'
+                    if name.startswith("syscalls:") else f"-e {shlex.quote(name)}"
+                    for name in ev_names
+                )
+                script = ('perf_exe=$1; ctl=$2; filt="$3 && common_pid != $$"; shift 3; '
+                          'exec "$perf_exe" record -q -o - -R -c 1 -k mono '
+                          f'--synth=task --control "$ctl" {ev_args} -a "$@"')
+                cmd = ["/bin/sh", "-c", script, "sh", self.perf_exe,
+                       f"fd:{ctl_r},{ack_w}", self_filt]
+                if self.workload:
+                    cmd += ["--", *self.workload]
+            else:
+                # Quiet so that only errors are written to stderr, see error_text().
+                cmd = [self.perf_exe, "record", "-q", "-o", "-", "-R", "-c", "1", "-k", "mono",
+                       "--synth=task", "--control", f"fd:{ctl_r},{ack_w}"]
+                for name in ev_names:
+                    cmd += ["-e", name]
+                # Record system wide, as timechart__record() does. Switches into a
+                # task and idle states aren't seen by events following tasks. With
+                # a workload, recording stops when it exits, otherwise when stopped.
+                cmd.append("-a")
+                if self.workload:
+                    cmd += ["--", *self.workload]
+            self.origin = monotonic_ns()
+            # A new session so that signals for the terminal aren't received.
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                         stderr=self.stderr, pass_fds=(ctl_r, ack_w),
+                                         start_new_session=True)
+            assert self.proc.stdout
+            proc_fd = self.proc.stdout.fileno()
+            self.grow_pipe(proc_fd)
+            self.tee_r, tee_w = os.pipe()
+            self.pump_thread = threading.Thread(target=self.pump,
+                                                args=(proc_fd, tee_w, output),
+                                                daemon=True)
+            try:
+                self.pump_thread.start()
+            except BaseException:
+                self.pump_thread = None
+                os.close(tee_w)
+                raise
+            # Closed by the pump thread.
+            output = None
+            self.data_fd = self.tee_r
+            self.grow_pipe(self.data_fd)
+            self.control_thread = threading.Thread(target=self.control_loop, daemon=True)
+            try:
+                self.control_thread.start()
+            except BaseException:
+                self.control_thread = None
+                raise
+        except BaseException:
+            self.stop()
+            if output:
+                output.close()
+            raise
+        finally:
+            for fd in child_fds:
+                os.close(fd)
+
+    @staticmethod
+    def grow_pipe(fd: int) -> None:
+        """Make the pipe bigger, if allowed, to absorb bursts of events."""
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, LIVE_PIPE_SIZE)
+        except OSError:
+            pass
+
+    def write_pump(self, dst: int, data: bytes) -> bool:
+        """Write data to dst until complete, stopped, or dst is closed."""
+        view = memoryview(data)
+        while not self.stopping.is_set() and view:
+            try:
+                view = view[os.write(dst, view):]
+            except BlockingIOError:
+                select.select([self.wake_r], [dst], [], 0.1)
+                self.drain_wake()
+            except OSError:
+                return False
+        return not self.stopping.is_set()
+
+    def pump(self, src: int, dst: int, output: Any) -> None:
+        """Forward events from src to dst, saving to output and flushing idle rounds.
+
+        perf.session buffers a round of events in ordered_events until the next
+        PERF_RECORD_FINISHED_ROUND, while perf record only writes one when a
+        pass reads new bytes. Once control_loop() confirms a pass read nothing,
+        a synthetic PERF_RECORD_FINISHED_ROUND is written at the record boundary
+        so buffered events are delivered promptly when paused or idle. When
+        stopping, src is still drained to EOF so perf record doesn't block
+        writing before terminating its workload.
+        """
+        os.set_blocking(src, False)
+        os.set_blocking(dst, False)
+        tracker = self.tracker
+        forwarding = True
+        eof = False
+        try:
+            while not eof:
+                read_fds = [src] if self.stopping.is_set() else [src, self.wake_r]
+                try:
+                    select.select(read_fds, [], [])
+                except OSError:
+                    break
+                if not self.stopping.is_set():
+                    self.drain_wake()
+                with self.round_lock:
+                    seq = self.flush_seq
+                    target = self.flush_round_target
+                while True:
+                    try:
+                        buf = os.read(src, 1 << 16)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        eof = True
+                        break
+                    if not buf:
+                        eof = True
+                        break
+                    if output:
+                        output.write(buf)
+                    with self.round_lock:
+                        tracker.feed(buf)
+                    if forwarding and not self.stopping.is_set():
+                        # Keep draining src if dst is no longer read.
+                        forwarding = self.write_pump(dst, buf)
+                if eof or not forwarding or self.stopping.is_set():
+                    continue
+                flush = False
+                if target is not None:
+                    with self.round_lock:
+                        if self.flush_round_target is not None:
+                            if not tracker.valid:
+                                if self.flush_seq == seq:
+                                    self.flush_round_target = None
+                            elif tracker.at_boundary():
+                                if (tracker.unflushed_round and
+                                        (target < 0 or tracker.rounds == target)):
+                                    tracker.unflushed_round = False
+                                    flush = True
+                                if self.flush_seq == seq:
+                                    self.flush_round_target = None
+                if flush:
+                    forwarding = self.write_pump(dst, PerfPipeTracker.FINISHED_ROUND_EVENT)
+        finally:
+            if output:
+                output.close()
+            os.close(dst)
+
+    def send(self, cmd: str) -> bool:
+        """Send a command to perf record and wait for its acknowledgment."""
+        try:
+            os.write(self.ctl_fd, f"{cmd}\n".encode())
+            # The acknowledgment is "ack\n" followed by a NUL, which may be
+            # read before or with the next acknowledgment.
+            ack = b""
+            while b"\n" not in ack:
+                # perf record may be slow to respond if it is blocked writing
+                # data, so wait until it exits or recording is stopped.
+                if self.stopping.is_set() or (self.proc and self.proc.poll() is not None):
+                    return False
+                ready, _, _ = select.select([self.ack_fd], [], [], 0.5)
+                if ready:
+                    buf = os.read(self.ack_fd, 16)
+                    if not buf:
+                        return False
+                    ack += buf
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def control_loop(self) -> None:
+        """Send queued commands, otherwise pings that flush perf record's buffers."""
+        try:
+            while not self.stopping.is_set():
+                try:
+                    cmd = self.commands.get(timeout=self.flush_interval)
+                except queue.Empty:
+                    if self.paused:
+                        continue
+                    cmd = "ping"
+                if not cmd or self.stopping.is_set():
+                    break
+                prev_rounds = -1
+                if cmd == "ping" and not self.paused:
+                    with self.round_lock:
+                        if self.tracker.unflushed_round:
+                            prev_rounds = self.tracker.rounds
+                if not self.send(cmd):
+                    break
+                if cmd == "disable":
+                    # A following ping waits until perf record finishes draining
+                    # the disabled buffers before flushing the final round.
+                    if not self.stopping.is_set() and self.send("ping"):
+                        with self.round_lock:
+                            self.flush_round_target = -1
+                            self.flush_seq += 1
+                        self.wake_pump()
+                elif cmd == "enable":
+                    with self.round_lock:
+                        self.flush_round_target = None
+                        self.flush_seq += 1
+                elif prev_rounds >= 0 and not self.stopping.is_set() and self.send("ping"):
+                    with self.round_lock:
+                        if self.flush_round_target is None:
+                            self.flush_round_target = prev_rounds
+                            self.flush_seq += 1
+                    self.wake_pump()
+        finally:
+            self.close_control_fds()
+
+    def set_paused(self, paused: bool) -> None:
+        """Pause or resume recording."""
+        self.paused = paused
+        self.commands.put("disable" if paused else "enable")
+
+    def backlog(self) -> float:
+        """The fraction of the data pipe filled with data waiting to be processed."""
+        with self.fd_lock:
+            fd = self.data_fd
+            if fd < 0:
+                return 0.0
+            try:
+                pending = array.array("i", [0])
+                fcntl.ioctl(fd, termios.FIONREAD, pending)
+                size = fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ)
+            except (OSError, ValueError):
+                return 0.0
+        return pending[0] / max(size, 1)
+
+    def stop(self) -> None:
+        """Stop recording, perf record then writes any remaining data and exits.
+
+        Called from both the UI thread and the thread processing the events,
+        so they don't both signal, reap and close perf record's pipes at once.
+        """
+        self.stopping.set()
+        self.commands.put("")
+        self.wake_pump()
+        with self.stop_lock:
+            self._stop()
+
+    def _stop(self) -> None:
+        """Stop perf record and the threads, stop_lock must be held."""
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                try:
+                    proc.send_signal(signal.SIGINT)
+                except OSError:
+                    pass
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                # Kill the whole session so a workload isn't left running.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                proc.wait()
+        if self.pump_thread and self.pump_thread is not threading.current_thread():
+            self.pump_thread.join(timeout=1)
+        if self.control_thread and self.control_thread is not threading.current_thread():
+            self.control_thread.join(timeout=1)
+        self.close_control_fds()
+        self.close_wake_fds()
+        self.close_data_fds()
+        self.restore_own_comm()
+
+    def close_data_fds(self) -> None:
+        """Close the read ends of the data pipes, stop_lock must be held.
+
+        perf.data() duplicates the file descriptor it reads from, so they
+        aren't needed once processing has started. Closing them means writes
+        to them fail, rather than block, once they are no longer read.
+        """
+        with self.fd_lock:
+            self.data_fd = -1
+            tee_r, self.tee_r = self.tee_r, -1
+            if tee_r >= 0:
+                try:
+                    os.close(tee_r)
+                except OSError:
+                    pass
+        # Unless the pump thread is still reading from it.
+        if self.proc and self.proc.stdout and not (self.pump_thread and
+                                                   self.pump_thread.is_alive()):
+            self.proc.stdout.close()
+
+    def error_text(self) -> str:
+        """The last lines written to stderr by perf record, to explain failures.
+
+        Usage text that follows an error in the options is dropped.
+        """
+        self.stderr.seek(0)
+        lines = self.stderr.read().decode(errors="replace").strip().splitlines()
+        for i, line in enumerate(lines):
+            if line.strip().startswith("Usage: perf record"):
+                lines = lines[:i]
+                break
+        return "\n".join(line for line in lines[-10:] if line.strip())
+
+
 def main() -> None:
     """Parse arguments, read the perf.data file and run the app."""
     parser = argparse.ArgumentParser(
         description="Interactive timechart of CPU, task and I/O activity.")
-    parser.add_argument("-i", "--input", default="perf.data", help="input perf.data file")
+    parser.add_argument("-i", "--input", help="input perf.data file, default perf.data")
     parser.add_argument("-P", "--power-only", action="store_true",
                         help="only show CPU power information")
     parser.add_argument("-T", "--tasks-only", action="store_true",
                         help="only show task information")
+    parser.add_argument("-I", "--io-only", action="store_true",
+                        help="only record or show I/O information")
     parser.add_argument("-p", "--process", action="append", default=[],
                         help="only show processes with the given name or PID, may be repeated")
     parser.add_argument("--dump", action="store_true",
                         help="print a text summary rather than running the interactive UI")
+    parser.add_argument("--live", action="store_true",
+                        help="record events with perf record and show them as they happen")
+    parser.add_argument("--window", type=float,
+                        help=f"seconds of recent events kept and shown in live mode, "
+                        f"default {LIVE_WINDOW:g}")
+    parser.add_argument("-o", "--output",
+                        help="in live mode, also save the recorded events to this file")
+    parser.add_argument("--perf", help="perf executable used to record in live mode")
+    parser.add_argument("workload", nargs=argparse.REMAINDER,
+                        help="in live mode, a command to run, recording the whole system "
+                        "until it exits")
     args = parser.parse_args()
+    workload = args.workload[1:] if args.workload[:1] == ["--"] else args.workload
+
+    def error(msg: str) -> NoReturn:
+        print(f"Error: {msg}", file=sys.stderr)
+        sys.exit(1)
 
     if args.power_only and args.tasks_only:
-        print("Error: -P and -T options cannot be used at the same time.", file=sys.stderr)
-        sys.exit(1)
+        error("-P and -T options cannot be used at the same time.")
+    if args.io_only and (args.power_only or args.tasks_only):
+        error("-I cannot be used with -P or -T.")
 
-    if args.input == "-":
+    if args.live:
+        if args.input or args.dump:
+            error("--live can't be used with -i or --dump.")
+        window = LIVE_WINDOW if args.window is None else args.window
+        if not math.isfinite(window * NSEC_PER_SEC) or window <= 0:
+            error("--window must be a positive number of seconds.")
+        perf_exe = args.perf or shutil.which("perf") or "perf"
+        recorder = LiveRecorder(perf_exe, args.power_only, args.tasks_only, workload,
+                                args.output, io_only=args.io_only)
+        try:
+            recorder.start()
+        except OSError as e:
+            error(f"failed to start '{perf_exe} record': {e}")
+        try:
+            app = TimechartApp("live", args.power_only, args.tasks_only, args.process,
+                               live=recorder, window=window, io_only=args.io_only)
+            app.run()
+        finally:
+            recorder.stop()
+        sys.exit(app.return_code or 0)
+
+    if args.window is not None or args.output or workload:
+        error("--window, -o and a workload require --live.")
+    input_name = args.input or "perf.data"
+    if input_name == "-":
         if not args.dump:
             # The interactive UI reads the keyboard from stdin.
-            print("Error: reading perf.data from stdin requires --dump.", file=sys.stderr)
-            sys.exit(1)
-    elif not os.path.exists(args.input):
-        print(f"Error: {args.input} not found. (try 'perf timechart record' first)",
-              file=sys.stderr)
-        sys.exit(1)
+            error("reading perf.data from stdin requires --dump.")
+    elif not os.path.exists(input_name):
+        error(f"{input_name} not found. (try 'perf timechart record' first)")
 
     if args.dump:
-        data = load_data(args.input)
-        data.dump(args.power_only, args.tasks_only, args.process)
+        data = load_data(input_name)
+        data.dump(args.power_only, args.tasks_only, args.process, io_only=args.io_only)
         return
 
     # The app starts immediately and loads the data in the background.
-    app = TimechartApp(args.input, args.power_only, args.tasks_only, args.process)
+    app = TimechartApp(input_name, args.power_only, args.tasks_only, args.process,
+                       io_only=args.io_only)
     app.run()
     sys.exit(app.return_code or 0)
 
 
-def read_events(data: TimechartData, input_name: str) -> None:
-    """Process the events in input_name into data, raising on errors."""
+def read_events(data: TimechartData, source: Union[str, int]) -> None:
+    """Process the events in the named file, or pipe file descriptor, into data.
+
+    Raises on errors.
+    """
     if data.cancelled:
         raise LoadCancelled()
     try:
-        data.session = perf.session(perf.data(input_name), sample=data.process_event)
+        pdata = perf.data(source) if isinstance(source, str) else perf.data(fd=source)
+        data.session = perf.session(pdata, sample=data.process_event)
         data.session.process_events()
         data.finish()
     finally:
