@@ -20,10 +20,14 @@ ap.add_argument('--per-die', action='store_true')
 ap.add_argument('--per-node', action='store_true')
 ap.add_argument('--per-socket', action='store_true')
 ap.add_argument('--metric-only', action='store_true')
-ap.add_argument('--file', type=argparse.FileType('r'), default=sys.stdin)
+ap.add_argument('--file', default=None)
 args = ap.parse_args()
 
-Lines = args.file.readlines()
+if args.file:
+  with open(args.file, encoding='utf-8') as f:
+    Lines = f.readlines()
+else:
+  Lines = sys.stdin.readlines()
 
 def isfloat(num):
   try:
