@@ -107,7 +107,7 @@
         "ScaleUnit": "1per_instr"
     },
     {
-        "BriefDescription": "Bandwidth observed by the integrated I/O traffic contoller (IIO) of IO reads that are initiated by end device controllers that are requesting memory from the CPU",
+        "BriefDescription": "Bandwidth observed by the integrated I/O traffic controller (IIO) of IO reads that are initiated by end device controllers that are requesting memory from the CPU",
         "MetricExpr": "UNC_IIO_DATA_REQ_OF_CPU.MEM_READ.ALL_PARTS * 4 / 1e6 / duration_time",
         "MetricName": "iio_bandwidth_read",
         "ScaleUnit": "1MB/s"
