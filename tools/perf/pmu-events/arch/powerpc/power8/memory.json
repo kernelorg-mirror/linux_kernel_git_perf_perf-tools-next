@@ -152,7 +152,7 @@
   {
     "EventCode": "0x1c05e",
     "EventName": "PM_MEM_LOC_THRESH_LSU_MED",
-    "BriefDescription": "Local memory above theshold for data prefetch",
+    "BriefDescription": "Local memory above threshold for data prefetch",
     "PublicDescription": ""
   },
   {

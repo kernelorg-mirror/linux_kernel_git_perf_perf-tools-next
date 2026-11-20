@@ -17,7 +17,7 @@
   {
     "EventCode": "0x4D05C",
     "EventName": "PM_DP_QP_FLOP_CMPL",
-    "BriefDescription": "Double-Precion or Quad-Precision instruction completed"
+    "BriefDescription": "Double-Precision or Quad-Precision instruction completed"
   },
   {
     "EventCode": "0x4E04C",

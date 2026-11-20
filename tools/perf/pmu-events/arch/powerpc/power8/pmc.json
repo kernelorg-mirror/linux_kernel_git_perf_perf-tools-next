@@ -98,7 +98,7 @@
   {
     "EventCode": "0x101e8",
     "EventName": "PM_THRESH_EXC_256",
-    "BriefDescription": "Threshold counter exceed a count of 256",
+    "BriefDescription": "Threshold counter exceeded a count of 256",
     "PublicDescription": ""
   },
   {
@@ -110,7 +110,7 @@
   {
     "EventCode": "0x101e6",
     "EventName": "PM_THRESH_EXC_4096",
-    "BriefDescription": "Threshold counter exceed a count of 4096",
+    "BriefDescription": "Threshold counter exceeded a count of 4096",
     "PublicDescription": ""
   },
   {

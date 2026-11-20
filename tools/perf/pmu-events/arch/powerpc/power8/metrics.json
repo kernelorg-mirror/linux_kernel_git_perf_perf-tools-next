@@ -30,7 +30,7 @@
         "MetricName": "ccache_mispredict_rate_percent"
     },
     {
-        "BriefDescription": "Percent of count catch mispredictions out of all completed branches that required count cache predictionn",
+        "BriefDescription": "Percent of count cache mispredictions out of all completed branches that required count cache prediction",
         "MetricExpr": "PM_BR_MPRED_CCACHE / (PM_BR_PRED_CCACHE_BR0 + PM_BR_PRED_CCACHE_BR1) * 100",
         "MetricGroup": "branch_prediction",
         "MetricName": "ccache_misprediction_percent"
@@ -969,7 +969,7 @@
         "MetricName": "l2_inst_miss_rate_percent"
     },
     {
-        "BriefDescription": "L2 dmand  Load Miss Rate (per run instruction)(%)",
+        "BriefDescription": "L2 demand  Load Miss Rate (per run instruction)(%)",
         "MetricExpr": "PM_DATA_FROM_L2MISS * 100 / PM_RUN_INST_CMPL",
         "MetricGroup": "general",
         "MetricName": "l2_ld_miss_rate_percent"
@@ -1215,7 +1215,7 @@
         "MetricName": "stores_per_inst"
     },
     {
-        "BriefDescription": "Icache Fetchs per Icache Miss",
+        "BriefDescription": "Icache Fetches per Icache Miss",
         "MetricExpr": "(PM_L1_ICACHE_MISS - PM_IC_PREF_WRITE) / PM_L1_ICACHE_MISS",
         "MetricGroup": "instruction_stats_percent_per_ref",
         "MetricName": "icache_miss_reload"
@@ -2003,7 +2003,7 @@
         "MetricName": "expansion_overhead_cpi"
     },
     {
-        "BriefDescription": "Total Fixed point operations executded in the Load/Store Unit following a load/store operation",
+        "BriefDescription": "Total Fixed point operations executed in the Load/Store Unit following a load/store operation",
         "MetricExpr": "PM_LSU_FX_FIN/PM_RUN_INST_CMPL",
         "MetricName": "fixed_in_lsu_per_inst"
     },

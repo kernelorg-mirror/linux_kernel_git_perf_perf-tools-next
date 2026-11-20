@@ -212,13 +212,13 @@
   {
     "EventCode": "0x40a0",
     "EventName": "PM_BR_UNCOND_BR0",
-    "BriefDescription": "Unconditional Branch Completed on BR0. HW branch prediction was not used for this branch. This can be an I-form branch, a B-form branch with BO-field set to branch always, or a B-form branch which was coverted to a Resolve",
+    "BriefDescription": "Unconditional Branch Completed on BR0. HW branch prediction was not used for this branch. This can be an I-form branch, a B-form branch with BO-field set to branch always, or a B-form branch which was converted to a Resolve",
     "PublicDescription": ""
   },
   {
     "EventCode": "0x40a2",
     "EventName": "PM_BR_UNCOND_BR1",
-    "BriefDescription": "Unconditional Branch Completed on BR1. HW branch prediction was not used for this branch. This can be an I-form branch, a B-form branch with BO-field set to branch always, or a B-form branch which was coverted to a Resolve",
+    "BriefDescription": "Unconditional Branch Completed on BR1. HW branch prediction was not used for this branch. This can be an I-form branch, a B-form branch with BO-field set to branch always, or a B-form branch which was converted to a Resolve",
     "PublicDescription": ""
   },
   {
@@ -656,7 +656,7 @@
   {
     "EventCode": "0x4e050",
     "EventName": "PM_DC_PREF_STREAM_FUZZY_CONF",
-    "BriefDescription": "A demand load referenced a line in an active fuzzy prefetch stream. The stream could have been allocated through the hardware prefetch mechanism or through software.Fuzzy stream confirm (out of order effects, or pf cant keep up)",
+    "BriefDescription": "A demand load referenced a line in an active fuzzy prefetch stream. The stream could have been allocated through the hardware prefetch mechanism or through software. Fuzzy stream confirm (out of order effects, or pf can't keep up)",
     "PublicDescription": ""
   },
   {
@@ -1095,7 +1095,7 @@
     "EventCode": "0x1000a",
     "EventName": "PM_GRP_BR_MPRED_NONSPEC",
     "BriefDescription": "Group experienced non-speculative branch redirect",
-    "PublicDescription": "Group experienced Non-speculative br mispredicct"
+    "PublicDescription": "Group experienced Non-speculative br mispredict"
   },
   {
     "EventCode": "0x30004",
@@ -1113,7 +1113,7 @@
     "EventCode": "0x1000c",
     "EventName": "PM_GRP_IC_MISS_NONSPEC",
     "BriefDescription": "Group experienced non-speculative I cache miss",
-    "PublicDescription": "Group experi enced Non-specu lative I cache miss"
+    "PublicDescription": "Group experienced Non-speculative I cache miss"
   },
   {
     "EventCode": "0x10130",
@@ -1136,7 +1136,7 @@
   {
     "EventCode": "0x50a6",
     "EventName": "PM_GRP_TERM_FPU_AFTER_BR",
-    "BriefDescription": "There were enough instructions in the Ibuffer, but FPU OP IN same group after a branch terminates a group, cant do partial flushes",
+    "BriefDescription": "There were enough instructions in the Ibuffer, but FPU OP IN same group after a branch terminates a group, can't do partial flushes",
     "PublicDescription": ""
   },
   {
@@ -1220,7 +1220,7 @@
   {
     "EventCode": "0x4096",
     "EventName": "PM_IC_RELOAD_PRIVATE",
-    "BriefDescription": "Reloading line was brought in private for a specific thread. Most lines are brought in shared for all eight thrreads. If RA does not match then invalidates and then brings it shared to other thread. In P7 line brought in private , then line was invalidat",
+    "BriefDescription": "Reloading line was brought in private for a specific thread. Most lines are brought in shared for all eight threads. If RA does not match then invalidates and then brings it shared to other thread. In P7 line brought in private , then line was invalidated",
     "PublicDescription": ""
   },
   {
@@ -1664,25 +1664,25 @@
   {
     "EventCode": "0x200301ea",
     "EventName": "PM_L1MISS_LAT_EXC_1024",
-    "BriefDescription": "L1 misses that took longer than 1024 cyles to resolve (miss to reload)",
+    "BriefDescription": "L1 misses that took longer than 1024 cycles to resolve (miss to reload)",
     "PublicDescription": "Reload latency exceeded 1024 cyc"
   },
   {
     "EventCode": "0x200401ec",
     "EventName": "PM_L1MISS_LAT_EXC_2048",
-    "BriefDescription": "L1 misses that took longer than 2048 cyles to resolve (miss to reload)",
+    "BriefDescription": "L1 misses that took longer than 2048 cycles to resolve (miss to reload)",
     "PublicDescription": "Reload latency exceeded 2048 cyc"
   },
   {
     "EventCode": "0x200101e8",
     "EventName": "PM_L1MISS_LAT_EXC_256",
-    "BriefDescription": "L1 misses that took longer than 256 cyles to resolve (miss to reload)",
+    "BriefDescription": "L1 misses that took longer than 256 cycles to resolve (miss to reload)",
     "PublicDescription": "Reload latency exceeded 256 cyc"
   },
   {
     "EventCode": "0x200201e6",
     "EventName": "PM_L1MISS_LAT_EXC_32",
-    "BriefDescription": "L1 misses that took longer than 32 cyles to resolve (miss to reload)",
+    "BriefDescription": "L1 misses that took longer than 32 cycles to resolve (miss to reload)",
     "PublicDescription": "Reload latency exceeded 32 cyc"
   },
   {
@@ -1694,7 +1694,7 @@
   {
     "EventCode": "0x408c",
     "EventName": "PM_L1_DEMAND_WRITE",
-    "BriefDescription": "Instruction Demand sectors wriittent into IL1",
+    "BriefDescription": "Instruction Demand sectors written into IL1",
     "PublicDescription": ""
   },
   {
@@ -1874,7 +1874,7 @@
   {
     "EventCode": "0x3e052",
     "EventName": "PM_L3_SW_PREF",
-    "BriefDescription": "Data stream touchto L3",
+    "BriefDescription": "Data stream touch to L3",
     "PublicDescription": ""
   },
   {
@@ -2793,7 +2793,7 @@
     "EventCode": "0x2001a",
     "EventName": "PM_NTCG_ALL_FIN",
     "BriefDescription": "Cycles after all instructions have finished to group completed",
-    "PublicDescription": "Ccycles after all instructions have finished to group completed"
+    "PublicDescription": "Cycles after all instructions have finished to group completed"
   },
   {
     "EventCode": "0x20ac",
@@ -2877,7 +2877,7 @@
     "EventCode": "0x200101e8",
     "EventName": "PM_RC_LIFETIME_EXC_256",
     "BriefDescription": "Number of times the RC machine for a sampled instruction was active for more than 256 cycles",
-    "PublicDescription": "Threshold counter exceed a count of 256"
+    "PublicDescription": "Threshold counter exceeded a count of 256"
   },
   {
     "EventCode": "0x200201e6",
@@ -3092,8 +3092,8 @@
   {
     "EventCode": "0xe0b8",
     "EventName": "PM_TM_FAIL_NON_TX_CONFLICT",
-    "BriefDescription": "Non transactional conflict from LSU whtver gets repoted to texas",
-    "PublicDescription": "Non transactional conflict from LSU whtver gets repoted to texas42"
+    "BriefDescription": "Non transactional conflict from LSU whatever gets reported to texas",
+    "PublicDescription": "Non transactional conflict from LSU whatever gets reported to texas42"
   },
   {
     "EventCode": "0x308a",
@@ -3140,8 +3140,8 @@
   {
     "EventCode": "0xe08e",
     "EventName": "PM_UP_PREF_POINTER",
-    "BriefDescription": "Micrpartition pointer prefetches",
-    "PublicDescription": "Micrpartition pointer prefetches42"
+    "BriefDescription": "Micropartition pointer prefetches",
+    "PublicDescription": "Micropartition pointer prefetches42"
   },
   {
     "EventCode": "0xa0a4",

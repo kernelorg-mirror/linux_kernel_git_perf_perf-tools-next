@@ -128,7 +128,7 @@
   {
     "EventCode": "0x3001a",
     "EventName": "PM_DATA_TABLEWALK_CYC",
-    "BriefDescription": "Tablwalk Cycles (could be 1 or 2 active)",
+    "BriefDescription": "Tablewalk Cycles (could be 1 or 2 active)",
     "PublicDescription": "Data Tablewalk Active"
   },
   {

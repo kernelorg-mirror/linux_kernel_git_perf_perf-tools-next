@@ -755,25 +755,25 @@
         "MetricName": "TLBIE_PER_INST"
     },
     {
-        "BriefDescription": "Average number of STCX instructions finshed per completed instruction",
+        "BriefDescription": "Average number of STCX instructions finished per completed instruction",
         "MetricExpr": "PM_STCX_FIN / PM_RUN_INST_CMPL",
         "MetricGroup": "General",
         "MetricName": "STCX_PER_INST"
     },
     {
-        "BriefDescription": "Average number of LARX instructions finshed per completed instruction",
+        "BriefDescription": "Average number of LARX instructions finished per completed instruction",
         "MetricExpr": "PM_LARX_FIN / PM_RUN_INST_CMPL",
         "MetricGroup": "General",
         "MetricName": "LARX_PER_INST"
     },
     {
-        "BriefDescription": "Average number of PTESYNC instructions finshed per completed instruction",
+        "BriefDescription": "Average number of PTESYNC instructions finished per completed instruction",
         "MetricExpr": "PM_PTESYNC_FIN / PM_RUN_INST_CMPL",
         "MetricGroup": "General",
         "MetricName": "PTESYNC_PER_INST"
     },
     {
-        "BriefDescription": "Average number of simple fixed-point instructions finshed in the store unit per completed instruction",
+        "BriefDescription": "Average number of simple fixed-point instructions finished in the store unit per completed instruction",
         "MetricExpr": "PM_FX_LSU_FIN / PM_RUN_INST_CMPL",
         "MetricGroup": "General",
         "MetricName": "FX_PER_INST"

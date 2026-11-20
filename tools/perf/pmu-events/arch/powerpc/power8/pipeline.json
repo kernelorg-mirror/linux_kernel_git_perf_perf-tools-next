@@ -116,7 +116,7 @@
   {
     "EventCode": "0x30006",
     "EventName": "PM_CMPLU_STALL_OTHER_CMPL",
-    "BriefDescription": "Instructions core completed while this tread was stalled",
+    "BriefDescription": "Instructions core completed while this thread was stalled",
     "PublicDescription": "Instructions core completed while this thread was stalled"
   },
   {
@@ -189,7 +189,7 @@
     "EventCode": "0x3405e",
     "EventName": "PM_IFETCH_THROTTLE",
     "BriefDescription": "Cycles in which Instruction fetch throttle was active",
-    "PublicDescription": "Cycles instruction fecth was throttled in IFU"
+    "PublicDescription": "Cycles instruction fetch was throttled in IFU"
   },
   {
     "EventCode": "0x10014",

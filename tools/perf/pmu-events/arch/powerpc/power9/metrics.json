@@ -226,7 +226,7 @@
         "MetricName": "ict_noslot_cyc_other_cpi"
     },
     {
-        "BriefDescription": "Cycles in which the NTC instruciton is held at dispatch for any reason",
+        "BriefDescription": "Cycles in which the NTC instruction is held at dispatch for any reason",
         "MetricExpr": "PM_ICT_NOSLOT_DISP_HELD/PM_RUN_INST_CMPL",
         "MetricGroup": "cpi_breakdown",
         "MetricName": "ict_noslot_disp_held_cpi"
@@ -958,7 +958,7 @@
         "MetricName": "l2_inst_miss_rate_percent"
     },
     {
-        "BriefDescription": "L2 dmand Load Miss Rate (per run instruction)(%)",
+        "BriefDescription": "L2 demand Load Miss Rate (per run instruction)(%)",
         "MetricExpr": "PM_DATA_FROM_L2MISS * 100 / PM_RUN_INST_CMPL",
         "MetricGroup": "general",
         "MetricName": "l2_ld_miss_rate_percent"
@@ -1102,7 +1102,7 @@
         "MetricName": "l1_inst_miss_rate_percent"
     },
     {
-        "BriefDescription": "Icache Fetchs per Icache Miss",
+        "BriefDescription": "Icache Fetches per Icache Miss",
         "MetricExpr": "(PM_L1_ICACHE_MISS - PM_IC_PREF_WRITE) / PM_L1_ICACHE_MISS",
         "MetricGroup": "instruction_stats_percent_per_ref",
         "MetricName": "icache_miss_reload"

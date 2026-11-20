@@ -402,7 +402,7 @@
   {
     "EventCode": "0x30006",
     "EventName": "PM_CMPLU_STALL_OTHER_CMPL",
-    "BriefDescription": "Instructions the core completed while this tread was stalled"
+    "BriefDescription": "Instructions the core completed while this thread was stalled"
   },
   {
     "EventCode": "0x1005C",
@@ -432,7 +432,7 @@
   {
     "EventCode": "0x400FC",
     "EventName": "PM_ITLB_MISS",
-    "BriefDescription": "ITLB Reloaded. Counts 1 per ITLB miss for HPT but multiple for radix depending on number of levels traveresed"
+    "BriefDescription": "ITLB Reloaded. Counts 1 per ITLB miss for HPT but multiple for radix depending on number of levels traversed"
   },
   {
     "EventCode": "0x1E044",

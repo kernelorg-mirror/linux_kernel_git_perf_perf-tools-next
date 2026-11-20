@@ -72,7 +72,7 @@
   {
     "EventCode": "0x101E6",
     "EventName": "PM_THRESH_EXC_4096",
-    "BriefDescription": "Threshold counter exceed a count of 4096"
+    "BriefDescription": "Threshold counter exceeded a count of 4096"
   },
   {
     "EventCode": "0x3F14A",
