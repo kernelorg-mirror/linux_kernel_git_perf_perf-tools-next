@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
@@ -44,6 +45,7 @@ static void sig_handler(int signum __maybe_unused, siginfo_t *info,
 static int count_overflows(struct perf_event_attr *attr, void (*trigger)(int i))
 {
 	struct sigaction sa, old_sa;
+	sigset_t mask, old_mask, wait_mask;
 	uint64_t count = 0;
 	int fd, i, err = TEST_FAIL;
 
@@ -68,6 +70,13 @@ static int count_overflows(struct perf_event_attr *attr, void (*trigger)(int i))
 		return TEST_FAIL;
 	}
 
+	/* Block signals so we only receive while waiting after each trigger() */
+	sigemptyset(&mask);
+	sigaddset(&mask, REFRESH_SIGNAL);
+	sigprocmask(SIG_BLOCK, &mask, &old_mask);
+	wait_mask = old_mask;
+	sigdelset(&wait_mask, REFRESH_SIGNAL);
+
 	if (fcntl(fd, F_SETFL, O_RDWR | O_NONBLOCK | O_ASYNC) < 0 ||
 	    fcntl(fd, F_SETSIG, REFRESH_SIGNAL) < 0 ||
 	    fcntl(fd, F_SETOWN, getpid()) < 0) {
@@ -82,20 +91,35 @@ static int count_overflows(struct perf_event_attr *attr, void (*trigger)(int i))
 		pr_debug("PERF_EVENT_IOC_REFRESH failed: %s\n", strerror(errno));
 		goto out;
 	}
-	for (i = 0; i < NR_EVENTS; i++)
+	for (i = 0; i < NR_EVENTS; i++) {
+		struct timespec timeout = { .tv_sec = 2 };
+		int before = overflows;
+
 		trigger(i);
+
+		/* Unblock signal to count and refresh event before triggering again */
+		while (overflows == before) {
+			if (ppoll(NULL, 0, &timeout, &wait_mask) == 0)
+				break;
+		}
+		if (overflows == before) {
+			pr_debug("no overflow signal for trigger %d\n", i);
+			break;
+		}
+	}
 	ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
 
 	if (read(fd, &count, sizeof(count)) != sizeof(count))
 		pr_debug("failed to read the event count\n");
 	pr_debug("%d events, count %" PRIu64 ", %d overflows (%d POLL_HUP), re-arm errno %d\n",
 		 NR_EVENTS, count, overflows, hups, refresh_errno);
-	/* Unrelated page faults can only add overflows, never hide one. */
-	if (overflows >= NR_EVENTS)
+
+	if (overflows == NR_EVENTS)
 		err = TEST_OK;
 out:
 	/* Close first: a late signal must still find our handler. */
 	close(fd);
+	sigprocmask(SIG_SETMASK, &old_mask, NULL);
 	sigaction(REFRESH_SIGNAL, &old_sa, NULL);
 	return err;
 }
