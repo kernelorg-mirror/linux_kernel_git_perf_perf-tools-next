@@ -5,7 +5,6 @@
 #include <libgen.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <inttypes.h>
@@ -16,6 +15,7 @@
 #include <linux/stringify.h>
 #include <linux/kernel.h>
 #include <linux/unaligned.h>
+#include <linux/string.h>
 
 #include "event.h"
 #include "debug.h"
